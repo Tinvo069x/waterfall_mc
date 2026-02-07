@@ -5,22 +5,9 @@ from datetime import datetime
 import tempfile
 
 # ========================
-# XLSB normalize
+# Helpers
 # ========================
-def normalize_xlsb_df(df):
-    for c in df.columns:
-        s = df[c]
-        s2 = pd.to_numeric(s, errors="ignore")
-
-        if pd.api.types.is_numeric_dtype(s2):
-            if s2.dropna().between(20000, 60000).mean() > 0.8:
-                s2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(s2, unit="D")
-
-        df[c] = s2
-    return df
-
-
-def read_excel_safely(path, sheet, header_row):
+def read_excel_sheets(path):
     p = Path(path)
     suf = p.suffix.lower()
 
@@ -31,28 +18,26 @@ def read_excel_safely(path, sheet, header_row):
     elif suf == ".xls":
         engine = "xlrd"
     else:
-        raise ValueError(f"Unsupported format: {suf}")
+        raise ValueError("Unsupported format")
 
-    if sheet == "" or sheet is None:
-        xls = pd.ExcelFile(p, engine=engine)
-        sheet = xls.sheet_names[0]
+    xls = pd.ExcelFile(p, engine=engine)
+    return xls, xls.sheet_names, engine
 
+
+def read_sheet(path, sheet, header_row, engine):
     df = pd.read_excel(
-        p,
+        path,
         sheet_name=sheet,
         header=header_row,
         engine=engine,
         dtype=object
     )
-
-    if suf == ".xlsb":
-        df = normalize_xlsb_df(df)
-    else:
-        df = df.apply(lambda s: pd.to_numeric(s, errors="ignore"))
-
     return df
 
 
+# ========================
+# Processing (giữ nguyên logic)
+# ========================
 def convert_headers_to_yyyyww(cols: pd.Index):
     s = pd.Index(cols).astype(str)
     is_yyyyww = s.str.fullmatch(r"\d{6}", na=False)
@@ -74,7 +59,7 @@ def convert_headers_to_yyyyww(cols: pd.Index):
     return new, week_mask
 
 
-def consolidate_weeks_fast(df, week_mask, sort_week_cols=True):
+def consolidate_weeks_fast(df, week_mask):
     non = df.loc[:, ~week_mask]
     wk = df.loc[:, week_mask]
 
@@ -83,15 +68,7 @@ def consolidate_weeks_fast(df, week_mask, sort_week_cols=True):
 
     wk_num = wk.apply(pd.to_numeric, errors="coerce")
     wk_sum = wk_num.groupby(wk_num.columns, axis=1).sum(min_count=1)
-
     wk_sum = wk_sum.loc[:, ~wk_sum.columns.duplicated(keep="last")]
-
-    if sort_week_cols:
-        def wkey(x):
-            xs = str(x)
-            return (0, int(xs)) if xs.isdigit() and len(xs) == 6 else (1, xs)
-
-        wk_sum = wk_sum[sorted(wk_sum.columns, key=wkey)]
 
     return pd.concat([non, wk_sum], axis=1)
 
@@ -105,30 +82,15 @@ def filter_firm_forecast_colB(df):
     return df.loc[mask].copy()
 
 
-def process_excel(file_path, sheet_name, header_row):
-    df = read_excel_safely(file_path, sheet_name, header_row)
-    df = filter_firm_forecast_colB(df)
-
-    new_cols, week_mask = convert_headers_to_yyyyww(pd.Index(df.columns))
-    df.columns = new_cols
-
-    df = consolidate_weeks_fast(df, week_mask=week_mask)
-
-    return df
-
-
 # ========================
 # STREAMLIT UI
 # ========================
-st.title("Convert Header to YYYYWW")
+st.title("Convert Header to YYYYWW-Tin Vo")
 
 uploaded_file = st.file_uploader(
     "Upload Excel file",
     type=["xlsx", "xlsm", "xls", "xlsb"]
 )
-
-sheet_name = st.text_input("Sheet name (optional)", "")
-header_row = st.number_input("Header row", min_value=0, max_value=100, value=0)
 
 if uploaded_file:
     suffix = Path(uploaded_file.name).suffix
@@ -137,22 +99,43 @@ if uploaded_file:
         tmp.write(uploaded_file.getbuffer())
         tmp_path = tmp.name
 
-    if st.button("Process"):
-        try:
-            df = process_excel(tmp_path, sheet_name, header_row)
+    try:
+        xls, sheet_names, engine = read_excel_sheets(tmp_path)
 
-            st.success("Processing complete")
+        sheet_selected = st.selectbox("Select sheet", sheet_names)
+        header_row = st.number_input("Header row", 0, 50, 0)
+
+        preview = pd.read_excel(
+            tmp_path,
+            sheet_name=sheet_selected,
+            header=None,
+            engine=engine,
+            nrows=10
+        )
+
+        st.write("Preview (raw):")
+        st.dataframe(preview)
+
+        if st.button("Process"):
+            df = read_sheet(tmp_path, sheet_selected, header_row, engine)
+            df = filter_firm_forecast_colB(df)
+
+            new_cols, week_mask = convert_headers_to_yyyyww(pd.Index(df.columns))
+            df.columns = new_cols
+            df = consolidate_weeks_fast(df, week_mask)
+
+            st.success("Done")
             st.dataframe(df)
 
-            out_file = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-            df.to_excel(out_file.name, index=False, engine="xlsxwriter")
+            out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+            df.to_excel(out.name, index=False)
 
-            with open(out_file.name, "rb") as f:
+            with open(out.name, "rb") as f:
                 st.download_button(
                     "Download result",
                     f,
                     file_name=f"{datetime.today().strftime('%Y%m%d')}.xlsx"
                 )
 
-        except Exception as e:
-            st.error(str(e))
+    except Exception as e:
+        st.error(str(e))
